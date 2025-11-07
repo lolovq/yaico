@@ -1,0 +1,118 @@
+// firestore.rules
+// Security rules for Yaico Firestore database
+
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    function hasRole(role) {
+      return isAuthenticated() && 
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == role;
+    }
+    
+    function isSubscribed() {
+      return isAuthenticated() && 
+        get(/databases/$(database)/documents/subscriptions/$(request.auth.uid)).data.status == 'active';
+    }
+    
+    function withinRateLimit() {
+      return request.time < resource.data.lastWrite + duration.value(1, 's');
+    }
+    
+    // Users collection
+    match /users/{userId} {
+      allow read: if isOwner(userId) || hasRole('admin');
+      allow create: if isAuthenticated() && request.auth.uid == userId;
+      allow update: if isOwner(userId) && 
+        request.resource.data.keys().hasAll(['email', 'name', 'createdAt']) &&
+        request.resource.data.createdAt == resource.data.createdAt;
+      allow delete: if false; // Users cannot be deleted
+    }
+    
+    // Transactions collection
+    match /transactions/{transactionId} {
+      allow read: if isOwner(resource.data.userId) || hasRole('admin');
+      allow create: if isAuthenticated() && 
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.keys().hasAll(['amount', 'description', 'status']) &&
+        request.resource.data.status in ['draft', 'processing'];
+      allow update: if isOwner(resource.data.userId) &&
+        request.resource.data.userId == resource.data.userId; // Can't change ownership
+      allow delete: if isOwner(resource.data.userId) && 
+        resource.data.status in ['draft', 'error'];
+    }
+    
+    // Clients collection
+    match /clients/{clientId} {
+      allow read: if isOwner(resource.data.userId);
+      allow create: if isAuthenticated() && 
+        request.resource.data.userId == request.auth.uid;
+      allow update: if isOwner(resource.data.userId);
+      allow delete: if isOwner(resource.data.userId) && 
+        !exists(/databases/$(database)/documents/transactions/{document=**}) // No linked transactions
+    }
+    
+    // Subscriptions collection
+    match /subscriptions/{userId} {
+      allow read: if isOwner(userId);
+      allow write: if false; // Only server can write subscriptions
+    }
+    
+    // Aggregated summaries (read-only for users)
+    match /summaries/{userId}/daily/{document=**} {
+      allow read: if isOwner(userId);
+      allow write: if false; // Only Cloud Functions can write
+    }
+    
+    match /summaries/{userId}/monthly/{document=**} {
+      allow read: if isOwner(userId);
+      allow write: if false;
+    }
+    
+    match /summaries/{userId}/yearly/{document=**} {
+      allow read: if isOwner(userId);
+      allow write: if false;
+    }
+    
+    // DBA monitoring (read-only for users)
+    match /dba_monitoring/{userId} {
+      allow read: if isOwner(userId);
+      allow write: if false;
+    }
+    
+    // User notifications
+    match /users/{userId}/notifications/{notificationId} {
+      allow read: if isOwner(userId);
+      allow update: if isOwner(userId) && 
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read']);
+      allow create, delete: if false; // Only server can create/delete
+    }
+    
+    // Audit logs (read-only)
+    match /audit_logs/{document=**} {
+      allow read: if hasRole('admin');
+      allow write: if false;
+    }
+    
+    // Rate limiting collection
+    match /rate_limits/{identifier} {
+      allow read: if false;
+      allow write: if false; // Managed by Cloud Functions
+    }
+    
+    // Public data (e.g., tax rates)
+    match /public/{document=**} {
+      allow read: if true;
+      allow write: if hasRole('admin');
+    }
+  }
+}
